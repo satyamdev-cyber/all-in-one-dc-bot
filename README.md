@@ -50,7 +50,7 @@ ASTRYX combines everything you need into one powerful Discord bot.
 ### 1. Clone the repository
 
 ```bash
-git clone <repository-url>
+git clone (https://github.com/satyamdev-cyber/all-in-one-dc-bot.git)
 cd ASTRYX
 ```
 
@@ -129,38 +129,5 @@ src/
 └── index.js
 ```
 
----
+Made with love by Satyam-Dev 
 
-# ❤️ Credits
-
-<div align="center">
-
-<a href="https://discord.com/users/1124248109472550993">
-<img src="https://lanyard.cnrad.dev/api/1124248109472550993?bg=1a1b26&idleMessage=Probably%20building%20something..." width="100%">
-</a>
-
-## itsfizys
-
-Special thanks for the development and inspiration behind ASTRYX.
-
-</div>
-
----
-
-# 📄 License
-
-This project is licensed under the **MELON OPEN SOURCE LICENSE**.
-
-See the [LICENSE](./LICENSE) file for complete terms and conditions.
-
-© 2026 **itsfizys (Aegis)**
-
----
-
-<div align="center">
-
-⭐ If you enjoy this project, consider giving it a star!
-
-Made with ❤️ for Discord communities.
-
-</div>
