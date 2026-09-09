@@ -1,0 +1,1585 @@
+#!/usr/bin/env python3
+
+import os
+import json
+import time
+import uuid
+import signal
+import shutil
+import secrets
+import hashlib
+import threading
+import subprocess
+from pathlib import Path
+from functools import wraps
+from flask import (
+    Flask, request, redirect, url_for, session,
+    render_template_string, jsonify, send_file, abort
+)
+
+# ============================================================
+# CONFIG
+# ============================================================
+
+HOST = "0.0.0.0"
+PORT = 8080
+
+BASE_DIR = Path.home() / "python-panel"
+SERVERS_DIR = BASE_DIR / "servers"
+DATA_FILE = BASE_DIR / "panel.json"
+
+BASE_DIR.mkdir(parents=True, exist_ok=True)
+SERVERS_DIR.mkdir(parents=True, exist_ok=True)
+
+app = Flask(__name__)
+app.secret_key = os.environ.get(
+    "PANEL_SECRET",
+    secrets.token_hex(32)
+)
+
+processes = {}
+process_lock = threading.Lock()
+
+# ============================================================
+# DATABASE
+# ============================================================
+
+def default_database():
+    return {
+        "admin": {
+            "username": "admin",
+            "password_hash": hash_password("admin123")
+        },
+        "servers": {}
+    }
+
+
+def hash_password(password):
+    return hashlib.sha256(password.encode()).hexdigest()
+
+
+def load_database():
+    if not DATA_FILE.exists():
+        data = default_database()
+        save_database(data)
+        return data
+
+    try:
+        with open(DATA_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return default_database()
+
+
+def save_database(data):
+    tmp = DATA_FILE.with_suffix(".tmp")
+
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=4)
+
+    tmp.replace(DATA_FILE)
+
+
+db = load_database()
+
+# ============================================================
+# AUTH
+# ============================================================
+
+def login_required(func):
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        if not session.get("logged_in"):
+            return redirect(url_for("login"))
+        return func(*args, **kwargs)
+
+    return wrapper
+
+
+# ============================================================
+# SERVER HELPERS
+# ============================================================
+
+def get_server(server_id):
+    return db["servers"].get(server_id)
+
+
+def server_path(server):
+    return Path(server["path"])
+
+
+def is_running(server_id):
+    with process_lock:
+        proc = processes.get(server_id)
+
+        if not proc:
+            return False
+
+        return proc.poll() is None
+
+
+def create_server_directory(server):
+    path = server_path(server)
+    path.mkdir(parents=True, exist_ok=True)
+
+
+def write_log(server_id, text):
+    server = get_server(server_id)
+
+    if not server:
+        return
+
+    path = server_path(server) / "console.log"
+
+    timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+
+    try:
+        with open(path, "a", encoding="utf-8", errors="replace") as f:
+            f.write(f"[{timestamp}] {text}\n")
+    except Exception:
+        pass
+
+
+def reader_thread(server_id, proc):
+    try:
+        for line in iter(proc.stdout.readline, ""):
+            if not line:
+                break
+
+            write_log(server_id, line.rstrip())
+    except Exception as e:
+        write_log(server_id, f"Output reader error: {e}")
+
+    try:
+        proc.stdout.close()
+    except Exception:
+        pass
+
+
+def start_server_process(server_id):
+    server = get_server(server_id)
+
+    if not server:
+        return False, "Server not found."
+
+    if is_running(server_id):
+        return False, "Server is already running."
+
+    create_server_directory(server)
+
+    command = server.get("command", "").strip()
+
+    if not command:
+        return False, "No startup command configured."
+
+    write_log(server_id, "========================================")
+    write_log(server_id, "Starting server")
+    write_log(server_id, f"Command: {command}")
+    write_log(server_id, "========================================")
+
+    try:
+        proc = subprocess.Popen(
+            command,
+            cwd=str(server_path(server)),
+            shell=True,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1
+        )
+
+        with process_lock:
+            processes[server_id] = proc
+
+        thread = threading.Thread(
+            target=reader_thread,
+            args=(server_id, proc),
+            daemon=True
+        )
+
+        thread.start()
+
+        return True, "Server started."
+
+    except Exception as e:
+        write_log(server_id, f"Failed to start: {e}")
+        return False, str(e)
+
+
+def stop_server_process(server_id):
+    server = get_server(server_id)
+
+    if not server:
+        return False, "Server not found."
+
+    with process_lock:
+        proc = processes.get(server_id)
+
+    if not proc or proc.poll() is not None:
+        return False, "Server is not running."
+
+    # Try Minecraft's normal stop command first.
+    try:
+        proc.stdin.write("stop\n")
+        proc.stdin.flush()
+
+        try:
+            proc.wait(timeout=15)
+        except subprocess.TimeoutExpired:
+            proc.terminate()
+
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+
+    except Exception:
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+
+    with process_lock:
+        processes.pop(server_id, None)
+
+    write_log(server_id, "Server stopped.")
+
+    return True, "Server stopped."
+
+
+def restart_server_process(server_id):
+    ok, msg = stop_server_process(server_id)
+
+    if not ok and "not running" not in msg.lower():
+        return False, msg
+
+    time.sleep(2)
+
+    return start_server_process(server_id)
+
+
+def send_command(server_id, command):
+    with process_lock:
+        proc = processes.get(server_id)
+
+    if not proc or proc.poll() is not None:
+        return False, "Server is not running."
+
+    try:
+        proc.stdin.write(command + "\n")
+        proc.stdin.flush()
+
+        write_log(server_id, f"> {command}")
+
+        return True, "Command sent."
+
+    except Exception as e:
+        return False, str(e)
+
+
+# ============================================================
+# SAFE PATH HANDLING
+# ============================================================
+
+def safe_path(server, relative):
+    root = server_path(server).resolve()
+
+    requested = (root / relative).resolve()
+
+    if requested != root and root not in requested.parents:
+        abort(403)
+
+    return requested
+
+
+# ============================================================
+# HTML
+# ============================================================
+
+STYLE = """
+<style>
+
+* {
+    box-sizing: border-box;
+}
+
+body {
+    margin: 0;
+    background: #0b0f17;
+    color: #e6edf3;
+    font-family: Arial, Helvetica, sans-serif;
+}
+
+a {
+    color: inherit;
+    text-decoration: none;
+}
+
+.nav {
+    height: 64px;
+    background: #111827;
+    border-bottom: 1px solid #263244;
+    display: flex;
+    align-items: center;
+    padding: 0 25px;
+    justify-content: space-between;
+}
+
+.logo {
+    font-size: 21px;
+    font-weight: bold;
+}
+
+.container {
+    max-width: 1250px;
+    margin: auto;
+    padding: 30px;
+}
+
+.card {
+    background: #111827;
+    border: 1px solid #263244;
+    border-radius: 12px;
+    padding: 20px;
+    margin-bottom: 20px;
+}
+
+.grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+    gap: 18px;
+}
+
+.server-card {
+    background: #111827;
+    border: 1px solid #263244;
+    border-radius: 12px;
+    padding: 20px;
+}
+
+.server-name {
+    font-size: 20px;
+    font-weight: bold;
+    margin-bottom: 10px;
+}
+
+.status {
+    display: inline-block;
+    padding: 5px 10px;
+    border-radius: 999px;
+    background: #1f2937;
+    margin-bottom: 15px;
+    font-size: 13px;
+}
+
+.online {
+    background: #064e3b;
+    color: #6ee7b7;
+}
+
+.offline {
+    background: #3f1d1d;
+    color: #fca5a5;
+}
+
+button,
+.btn {
+    background: #2563eb;
+    color: white;
+    border: 0;
+    border-radius: 7px;
+    padding: 9px 14px;
+    cursor: pointer;
+    display: inline-block;
+    margin: 3px;
+}
+
+.btn-danger {
+    background: #dc2626;
+}
+
+.btn-green {
+    background: #059669;
+}
+
+.btn-gray {
+    background: #374151;
+}
+
+input,
+textarea,
+select {
+    width: 100%;
+    background: #0b1220;
+    color: white;
+    border: 1px solid #334155;
+    border-radius: 7px;
+    padding: 11px;
+    margin-top: 6px;
+    margin-bottom: 15px;
+}
+
+textarea {
+    min-height: 300px;
+    font-family: monospace;
+}
+
+label {
+    font-size: 14px;
+    color: #aeb8c7;
+}
+
+.console {
+    background: #05080d;
+    border: 1px solid #263244;
+    border-radius: 8px;
+    height: 500px;
+    overflow-y: auto;
+    padding: 15px;
+    font-family: monospace;
+    white-space: pre-wrap;
+    color: #cbd5e1;
+}
+
+table {
+    width: 100%;
+    border-collapse: collapse;
+}
+
+td,
+th {
+    padding: 12px;
+    border-bottom: 1px solid #263244;
+    text-align: left;
+}
+
+.small {
+    color: #94a3b8;
+    font-size: 13px;
+}
+
+</style>
+"""
+
+# ============================================================
+# LOGIN
+# ============================================================
+
+LOGIN_HTML = """
+<!DOCTYPE html>
+<html>
+<head>
+<title>Python Panel Login</title>
+""" + STYLE + """
+</head>
+<body>
+
+<div class="container" style="max-width:450px;margin-top:100px">
+
+<div class="card">
+
+<h1>Python Panel</h1>
+
+<p class="small">Minecraft Server Management</p>
+
+<form method="POST">
+
+<label>Username</label>
+<input name="username" required>
+
+<label>Password</label>
+<input type="password" name="password" required>
+
+<button type="submit">Login</button>
+
+</form>
+
+</div>
+
+</div>
+
+</body>
+</html>
+"""
+
+
+@app.route("/login", methods=["GET", "POST"])
+def login():
+
+    if request.method == "POST":
+
+        username = request.form.get("username", "")
+        password = request.form.get("password", "")
+
+        if (
+            username == db["admin"]["username"]
+            and hash_password(password) == db["admin"]["password_hash"]
+        ):
+            session["logged_in"] = True
+            return redirect(url_for("dashboard"))
+
+        return "Invalid login", 401
+
+    return render_template_string(LOGIN_HTML)
+
+
+@app.route("/logout")
+def logout():
+    session.clear()
+    return redirect(url_for("login"))
+
+
+# ============================================================
+# DASHBOARD
+# ============================================================
+
+@app.route("/")
+@login_required
+def dashboard():
+
+    cards = ""
+
+    for sid, server in db["servers"].items():
+
+        running = is_running(sid)
+
+        status_class = "online" if running else "offline"
+        status = "ONLINE" if running else "OFFLINE"
+
+        cards += f"""
+        <div class="server-card">
+
+            <div class="server-name">
+                {server["name"]}
+            </div>
+
+            <div class="status {status_class}">
+                {status}
+            </div>
+
+            <p class="small">
+                ID: {sid}<br>
+                Port: {server.get("port", "N/A")}<br>
+                RAM: {server.get("ram", "N/A")} MB
+            </p>
+
+            <a class="btn" href="/server/{sid}">
+                Manage
+            </a>
+
+        </div>
+        """
+
+    if not cards:
+        cards = """
+        <div class="card">
+            No servers created yet.
+        </div>
+        """
+
+    html = """
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Python Panel</title>
+    """ + STYLE + """
+    </head>
+
+    <body>
+
+    <div class="nav">
+
+        <div class="logo">
+            Python Panel
+        </div>
+
+        <div>
+            <a class="btn" href="/create">
+                + Create Server
+            </a>
+
+            <a class="btn btn-gray" href="/logout">
+                Logout
+            </a>
+        </div>
+
+    </div>
+
+    <div class="container">
+
+        <h1>Dashboard</h1>
+
+        <p class="small">
+            Standalone server management panel
+        </p>
+
+        <div class="grid">
+    """ + cards + """
+        </div>
+
+    </div>
+
+    </body>
+    </html>
+    """
+
+    return render_template_string(html)
+
+
+# ============================================================
+# CREATE SERVER
+# ============================================================
+
+@app.route("/create", methods=["GET", "POST"])
+@login_required
+def create_server():
+
+    if request.method == "POST":
+
+        name = request.form.get("name", "").strip()
+        command = request.form.get("command", "").strip()
+        port = request.form.get("port", "25565").strip()
+        ram = request.form.get("ram", "2048").strip()
+
+        if not name:
+            return "Server name required", 400
+
+        sid = uuid.uuid4().hex[:10]
+
+        path = SERVERS_DIR / sid
+
+        server = {
+            "id": sid,
+            "name": name,
+            "command": command,
+            "port": port,
+            "ram": ram,
+            "path": str(path),
+            "created": int(time.time())
+        }
+
+        db["servers"][sid] = server
+        save_database(db)
+
+        path.mkdir(parents=True, exist_ok=True)
+
+        return redirect(url_for("server_page", server_id=sid))
+
+    html = """
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Create Server</title>
+    """ + STYLE + """
+    </head>
+
+    <body>
+
+    <div class="nav">
+        <div class="logo">Python Panel</div>
+        <a class="btn btn-gray" href="/">Back</a>
+    </div>
+
+    <div class="container">
+
+    <div class="card">
+
+    <h1>Create Server</h1>
+
+    <form method="POST">
+
+        <label>Server Name</label>
+        <input name="name"
+               placeholder="My Minecraft Server"
+               required>
+
+        <label>Startup Command</label>
+        <input name="command"
+               placeholder="java -Xms1G -Xmx2G -jar server.jar nogui"
+               required>
+
+        <label>Port</label>
+        <input name="port"
+               value="25565">
+
+        <label>RAM (MB)</label>
+        <input name="ram"
+               value="2048">
+
+        <button type="submit">
+            Create Server
+        </button>
+
+    </form>
+
+    </div>
+
+    </div>
+
+    </body>
+    </html>
+    """
+
+    return render_template_string(html)
+
+
+# ============================================================
+# SERVER PAGE
+# ============================================================
+
+@app.route("/server/<server_id>")
+@login_required
+def server_page(server_id):
+
+    server = get_server(server_id)
+
+    if not server:
+        return "Server not found", 404
+
+    running = is_running(server_id)
+
+    status = "ONLINE" if running else "OFFLINE"
+    status_class = "online" if running else "offline"
+
+    html = """
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>{{ server["name"] }}</title>
+    """ + STYLE + """
+    </head>
+
+    <body>
+
+    <div class="nav">
+
+        <div class="logo">
+            {{ server["name"] }}
+        </div>
+
+        <a class="btn btn-gray" href="/">
+            Dashboard
+        </a>
+
+    </div>
+
+    <div class="container">
+
+        <div class="card">
+
+            <h1>{{ server["name"] }}</h1>
+
+            <div class="status {{ status_class }}">
+                {{ status }}
+            </div>
+
+            <p class="small">
+                Port: {{ server.get("port") }}<br>
+                RAM: {{ server.get("ram") }} MB<br>
+                Directory: {{ server.get("path") }}
+            </p>
+
+            <button onclick="action('start')" class="btn-green">
+                Start
+            </button>
+
+            <button onclick="action('stop')" class="btn-danger">
+                Stop
+            </button>
+
+            <button onclick="action('restart')" class="btn">
+                Restart
+            </button>
+
+            <a href="/server/{{ server['id'] }}/files"
+               class="btn btn-gray">
+                Files
+            </a>
+
+            <a href="/server/{{ server['id'] }}/settings"
+               class="btn btn-gray">
+                Settings
+            </a>
+
+        </div>
+
+        <div class="card">
+
+            <h2>Console</h2>
+
+            <div id="console" class="console">
+                Loading...
+            </div>
+
+            <br>
+
+            <form onsubmit="sendCommand(event)">
+
+                <input id="command"
+                       placeholder="Enter console command..."
+                       autocomplete="off">
+
+                <button type="submit">
+                    Send
+                </button>
+
+            </form>
+
+        </div>
+
+    </div>
+
+<script>
+
+async function action(type) {
+
+    await fetch(
+        "/api/server/{{ server['id'] }}/" + type,
+        {method: "POST"}
+    );
+
+    location.reload();
+}
+
+async function sendCommand(event) {
+
+    event.preventDefault();
+
+    const input = document.getElementById("command");
+
+    const command = input.value;
+
+    if (!command)
+        return;
+
+    await fetch(
+        "/api/server/{{ server['id'] }}/command",
+        {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json"
+            },
+            body: JSON.stringify({
+                command: command
+            })
+        }
+    );
+
+    input.value = "";
+
+    loadConsole();
+}
+
+async function loadConsole() {
+
+    const response = await fetch(
+        "/api/server/{{ server['id'] }}/console"
+    );
+
+    const data = await response.json();
+
+    const consoleBox =
+        document.getElementById("console");
+
+    consoleBox.textContent = data.console;
+
+    consoleBox.scrollTop =
+        consoleBox.scrollHeight;
+}
+
+loadConsole();
+
+setInterval(loadConsole, 1500);
+
+</script>
+
+    </body>
+    </html>
+    """
+
+    return render_template_string(
+        html,
+        server=server,
+        status=status,
+        status_class=status_class
+    )
+
+
+# ============================================================
+# SERVER API
+# ============================================================
+
+@app.route("/api/server/<server_id>/start", methods=["POST"])
+@login_required
+def api_start(server_id):
+
+    ok, message = start_server_process(server_id)
+
+    return jsonify({
+        "success": ok,
+        "message": message
+    })
+
+
+@app.route("/api/server/<server_id>/stop", methods=["POST"])
+@login_required
+def api_stop(server_id):
+
+    ok, message = stop_server_process(server_id)
+
+    return jsonify({
+        "success": ok,
+        "message": message
+    })
+
+
+@app.route("/api/server/<server_id>/restart", methods=["POST"])
+@login_required
+def api_restart(server_id):
+
+    ok, message = restart_server_process(server_id)
+
+    return jsonify({
+        "success": ok,
+        "message": message
+    })
+
+
+@app.route("/api/server/<server_id>/command", methods=["POST"])
+@login_required
+def api_command(server_id):
+
+    data = request.get_json(silent=True) or {}
+
+    command = data.get("command", "").strip()
+
+    if not command:
+        return jsonify({
+            "success": False,
+            "message": "Command is empty."
+        })
+
+    ok, message = send_command(
+        server_id,
+        command
+    )
+
+    return jsonify({
+        "success": ok,
+        "message": message
+    })
+
+
+@app.route("/api/server/<server_id>/console")
+@login_required
+def api_console(server_id):
+
+    server = get_server(server_id)
+
+    if not server:
+        return jsonify({
+            "console": "Server not found."
+        }), 404
+
+    log_file = server_path(server) / "console.log"
+
+    if not log_file.exists():
+        return jsonify({
+            "console": "No console output yet."
+        })
+
+    try:
+
+        with open(
+            log_file,
+            "r",
+            encoding="utf-8",
+            errors="replace"
+        ) as f:
+
+            content = f.read()
+
+        # Keep browser response reasonable.
+        content = content[-100000:]
+
+        return jsonify({
+            "console": content
+        })
+
+    except Exception as e:
+
+        return jsonify({
+            "console": str(e)
+        })
+
+
+# ============================================================
+# FILE MANAGER
+# ============================================================
+
+@app.route("/server/<server_id>/files")
+@app.route("/server/<server_id>/files/<path:relative>")
+@login_required
+def files(server_id, relative=""):
+
+    server = get_server(server_id)
+
+    if not server:
+        return "Server not found", 404
+
+    current = safe_path(server, relative)
+
+    if not current.exists():
+        return "Path does not exist", 404
+
+    if not current.is_dir():
+        return send_file(current)
+
+    entries = []
+
+    for item in sorted(
+        current.iterdir(),
+        key=lambda x: (not x.is_dir(), x.name.lower())
+    ):
+
+        rel = item.relative_to(
+            server_path(server)
+        )
+
+        entries.append({
+            "name": item.name,
+            "path": str(rel),
+            "directory": item.is_dir(),
+            "size": item.stat().st_size if item.is_file() else ""
+        })
+
+    rows = ""
+
+    parent = Path(relative).parent
+
+    if relative:
+        parent_url = url_for(
+            "files",
+            server_id=server_id,
+            relative="" if str(parent) == "." else str(parent)
+        )
+
+        rows += f"""
+        <tr>
+            <td colspan="3">
+                <a class="btn btn-gray"
+                   href="{parent_url}">
+                    .. Parent
+                </a>
+            </td>
+        </tr>
+        """
+
+    for item in entries:
+
+        if item["directory"]:
+
+            href = url_for(
+                "files",
+                server_id=server_id,
+                relative=item["path"]
+            )
+
+            name = "📁 " + item["name"]
+
+        else:
+
+            href = url_for(
+                "download_file",
+                server_id=server_id,
+                relative=item["path"]
+            )
+
+            name = "📄 " + item["name"]
+
+        rows += f"""
+        <tr>
+            <td>
+                <a href="{href}">
+                    {name}
+                </a>
+            </td>
+            <td>{item["size"]}</td>
+            <td>
+                <button
+                    onclick="deleteFile('{item["path"]}')"
+                    class="btn btn-danger">
+                    Delete
+                </button>
+            </td>
+        </tr>
+        """
+
+    html = """
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Files</title>
+    """ + STYLE + """
+    </head>
+
+    <body>
+
+    <div class="nav">
+        <div class="logo">File Manager</div>
+        <a class="btn btn-gray"
+           href="/server/""" + server_id + """">
+           Back
+        </a>
+    </div>
+
+    <div class="container">
+
+    <div class="card">
+
+        <h2>Upload File</h2>
+
+        <form method="POST"
+              action="/server/""" + server_id + """/upload"
+              enctype="multipart/form-data">
+
+            <input type="hidden"
+                   name="path"
+                   value=\"""" + relative + """\">
+
+            <input type="file" name="file" required>
+
+            <button type="submit">
+                Upload
+            </button>
+
+        </form>
+
+    </div>
+
+    <div class="card">
+
+        <h2>
+            /""" + relative + """
+        </h2>
+
+        <table>
+
+        <tr>
+            <th>Name</th>
+            <th>Size</th>
+            <th>Actions</th>
+        </tr>
+
+        """ + rows + """
+
+        </table>
+
+    </div>
+
+    </div>
+
+<script>
+
+async function deleteFile(path) {
+
+    if (!confirm(
+        "Delete " + path + "?"
+    )) return;
+
+    await fetch(
+        "/server/""" + server_id + """/delete",
+        {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json"
+            },
+            body: JSON.stringify({
+                path: path
+            })
+        }
+    );
+
+    location.reload();
+}
+
+</script>
+
+    </body>
+    </html>
+    """
+
+    return render_template_string(html)
+
+
+@app.route("/server/<server_id>/download/<path:relative>")
+@login_required
+def download_file(server_id, relative):
+
+    server = get_server(server_id)
+
+    if not server:
+        return "Server not found", 404
+
+    path = safe_path(server, relative)
+
+    if not path.exists() or not path.is_file():
+        return "File not found", 404
+
+    return send_file(path, as_attachment=True)
+
+
+@app.route("/server/<server_id>/upload", methods=["POST"])
+@login_required
+def upload_file(server_id):
+
+    server = get_server(server_id)
+
+    if not server:
+        return "Server not found", 404
+
+    uploaded = request.files.get("file")
+    relative = request.form.get("path", "")
+
+    if not uploaded:
+        return "No file selected", 400
+
+    directory = safe_path(server, relative)
+
+    if not directory.exists() or not directory.is_dir():
+        return "Invalid directory", 400
+
+    filename = Path(uploaded.filename).name
+
+    if not filename:
+        return "Invalid filename", 400
+
+    destination = safe_path(
+        server,
+        str(Path(relative) / filename)
+    )
+
+    uploaded.save(destination)
+
+    return redirect(
+        url_for(
+            "files",
+            server_id=server_id,
+            relative=relative
+        )
+    )
+
+
+@app.route("/server/<server_id>/delete", methods=["POST"])
+@login_required
+def delete_file(server_id):
+
+    server = get_server(server_id)
+
+    if not server:
+        return jsonify({
+            "success": False
+        }), 404
+
+    data = request.get_json(silent=True) or {}
+
+    relative = data.get("path", "")
+
+    if not relative:
+        return jsonify({
+            "success": False
+        }), 400
+
+    path = safe_path(server, relative)
+
+    root = server_path(server).resolve()
+
+    if path == root:
+        return jsonify({
+            "success": False,
+            "message": "Cannot delete server root."
+        }), 403
+
+    try:
+
+        if path.is_dir():
+            shutil.rmtree(path)
+
+        elif path.exists():
+            path.unlink()
+
+        return jsonify({
+            "success": True
+        })
+
+    except Exception as e:
+
+        return jsonify({
+            "success": False,
+            "message": str(e)
+        }), 500
+
+
+# ============================================================
+# SETTINGS
+# ============================================================
+
+@app.route("/server/<server_id>/settings", methods=["GET", "POST"])
+@login_required
+def settings(server_id):
+
+    server = get_server(server_id)
+
+    if not server:
+        return "Server not found", 404
+
+    if request.method == "POST":
+
+        server["name"] = request.form.get(
+            "name",
+            server["name"]
+        ).strip()
+
+        server["command"] = request.form.get(
+            "command",
+            server["command"]
+        ).strip()
+
+        server["port"] = request.form.get(
+            "port",
+            server.get("port", "25565")
+        ).strip()
+
+        server["ram"] = request.form.get(
+            "ram",
+            server.get("ram", "2048")
+        ).strip()
+
+        save_database(db)
+
+        return redirect(
+            url_for(
+                "server_page",
+                server_id=server_id
+            )
+        )
+
+    html = """
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Settings</title>
+    """ + STYLE + """
+    </head>
+
+    <body>
+
+    <div class="nav">
+
+        <div class="logo">
+            Server Settings
+        </div>
+
+        <a class="btn btn-gray"
+           href="/server/""" + server_id + """">
+            Back
+        </a>
+
+    </div>
+
+    <div class="container">
+
+    <div class="card">
+
+    <h1>Settings</h1>
+
+    <form method="POST">
+
+        <label>Server Name</label>
+
+        <input name="name"
+               value=\"""" + server["name"] + """\">
+
+        <label>Startup Command</label>
+
+        <input name="command"
+               value=\"""" + server["command"] + """\">
+
+        <label>Port</label>
+
+        <input name="port"
+               value=\"""" + server.get("port", "25565") + """\">
+
+        <label>RAM (MB)</label>
+
+        <input name="ram"
+               value=\"""" + server.get("ram", "2048") + """\">
+
+        <button type="submit">
+            Save Changes
+        </button>
+
+    </form>
+
+    </div>
+
+    </div>
+
+    </body>
+    </html>
+    """
+
+    return render_template_string(html)
+
+
+# ============================================================
+# ADMIN: CHANGE PASSWORD
+# ============================================================
+
+@app.route("/admin/password", methods=["GET", "POST"])
+@login_required
+def change_password():
+
+    if request.method == "POST":
+
+        password = request.form.get("password", "")
+
+        if len(password) < 8:
+            return "Password must be at least 8 characters.", 400
+
+        db["admin"]["password_hash"] = hash_password(password)
+
+        save_database(db)
+
+        return "Password changed successfully."
+
+    html = """
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Change Password</title>
+    """ + STYLE + """
+    </head>
+
+    <body>
+
+    <div class="container">
+
+    <div class="card">
+
+    <h1>Change Admin Password</h1>
+
+    <form method="POST">
+
+        <label>New Password</label>
+
+        <input
+            type="password"
+            name="password"
+            minlength="8"
+            required
+        >
+
+        <button type="submit">
+            Change Password
+        </button>
+
+    </form>
+
+    </div>
+
+    </div>
+
+    </body>
+    </html>
+    """
+
+    return render_template_string(html)
+
+
+# ============================================================
+# DELETE SERVER
+# ============================================================
+
+@app.route("/server/<server_id>/delete-server", methods=["POST"])
+@login_required
+def delete_server(server_id):
+
+    server = get_server(server_id)
+
+    if not server:
+        return "Server not found", 404
+
+    if is_running(server_id):
+        stop_server_process(server_id)
+
+    path = server_path(server)
+
+    try:
+
+        if path.exists():
+            shutil.rmtree(path)
+
+    except Exception as e:
+        return f"Could not delete files: {e}", 500
+
+    db["servers"].pop(server_id, None)
+
+    save_database(db)
+
+    return redirect(url_for("dashboard"))
+
+
+# ============================================================
+# SHUTDOWN CLEANUP
+# ============================================================
+
+def cleanup():
+
+    with process_lock:
+        ids = list(processes.keys())
+
+    for server_id in ids:
+
+        try:
+            stop_server_process(server_id)
+        except Exception:
+            pass
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+if __name__ == "__main__":
+
+    print()
+    print("==============================================")
+    print("        PYTHON MINECRAFT PANEL")
+    print("==============================================")
+    print()
+    print(f"Data:    {DATA_FILE}")
+    print(f"Servers: {SERVERS_DIR}")
+    print()
+    print("Dashboard:")
+    print(f"http://127.0.0.1:{PORT}")
+    print()
+    print("Default login:")
+    print("Username: admin")
+    print("Password: admin123")
+    print()
+    print("IMPORTANT: change the password immediately.")
+    print()
+    print("Press CTRL+C to stop the panel.")
+    print()
+
+    try:
+        app.run(
+            host=HOST,
+            port=PORT,
+            threaded=True
+        )
+
+    except KeyboardInterrupt:
+        cleanup()
